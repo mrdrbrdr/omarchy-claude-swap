@@ -1,0 +1,295 @@
+#!/usr/bin/env bash
+# cswap-bar: data + action bridge for the omarchy-claude-swap bar plugin.
+# The QML panel polls `json` and runs every other command from its buttons.
+#
+# Usage: cswap-bar [--machines "local,server"] [--local-name NAME] <command> [args]
+#   json                    state of every machine (parallel)
+#   switch <email>          switch every machine to that account
+#   best                    best pick on the first machine, the others follow it
+#   only <machine> <email>  switch one machine (bring it back in line)
+#   threshold <pct>         autoswitch.threshold everywhere + restart running engines
+#   auto on|off             start/stop claude-swap-auto.service everywhere
+#                           (`on` installs the unit from ./systemd first where missing)
+#   disable|enable <email>  hold an account out of / return it to auto-rotation
+#   remove <email>          remove the account everywhere
+#   add-login               add THIS machine's current Claude Code login, copy it to the rest
+#   copy <email>            copy an account from THIS machine to the machines missing it
+#   add-token [email]       setup-token / API key on stdin, added everywhere
+#
+# Machines: "local" is this machine; anything else is an ssh destination
+# reached with BatchMode (key auth, no prompts) and its own ControlMaster
+# socket. Remote machines need bash, jq and claude-swap. Accounts are addressed
+# by email because slot numbers may differ between machines.
+#
+# Security: credentials only ever flow outward from this machine. Nothing a
+# remote machine holds is imported here, so a compromised server cannot plant
+# an account on the desktop. Machine names (ssh destinations) and account ids
+# (cswap arguments) are checked against plain patterns so neither can be read
+# as an option. Tokens travel on stdin, never on a command line.
+#
+# `cswap list --json` is served from claude-swap's shared usage store (it only
+# refetches entries older than its freshness floor), so polling adds no calls
+# to the rate-limited usage endpoint.
+set -o pipefail
+# Launched from the Omarchy shell, whose environment may lack ~/.local/bin.
+export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+machines="local"
+LOCAL_NAME=""
+while [[ ${1:-} == --* ]]; do
+  case "$1" in
+    --machines)   machines=${2:-}; shift 2 ;;
+    --local-name) LOCAL_NAME=${2:-}; shift 2 ;;
+    *) break ;;
+  esac
+done
+[[ -n $LOCAL_NAME ]] || LOCAL_NAME=$(hostname -s 2>/dev/null || echo local)
+IFS=, read -r -a MACHINES <<<"$machines"
+
+valid_machine() { [[ $1 == local || $1 =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]]; }
+valid_account() { [[ $1 =~ ^[A-Za-z0-9._%+][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; }
+for m in "${MACHINES[@]}"; do
+  valid_machine "$m" || { echo "cswap-bar: refusing machine name: $m" >&2; exit 2; }
+done
+[[ $LOCAL_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || LOCAL_NAME=local
+
+# ---------------------------------------------------------------------------
+# Runs on each machine. Every command prints exactly one JSON object, except
+# `export` (raw cswap payload on stdout) and `import` (reads it on stdin).
+read -r -d '' TARGET <<'EOF'
+export NO_COLOR=1
+export PATH="$HOME/.local/bin:$PATH"
+unit=claude-swap-auto.service
+log="$HOME/.local/state/claude-swap/auto.jsonl"
+if ! command -v jq >/dev/null 2>&1; then
+  printf '{"error":"jq is not installed on %s"}\n' "$(hostname -s)"; exit 0
+fi
+cs=$(command -v cswap)
+if [ -z "$cs" ]; then
+  jq -nc --arg h "$(hostname -s)" \
+    '{error: ("claude-swap is not installed on " + $h + " (uv tool install claude-swap)"),
+      code: 127, result: {error: {message: ("claude-swap is not installed on " + $h)}}}'
+  exit 0
+fi
+
+# wrap <cmd...>: one line {code, result, out, err}; result = stdout as JSON when it is JSON.
+wrap() {
+  local err out code
+  err=$(mktemp)
+  out=$("$@" 2>"$err"); code=$?
+  jq -nc --argjson code "$code" --arg out "$out" --rawfile err "$err" \
+    '{code: $code, result: ($out | fromjson? // null), out: ($out | .[-600:]), err: ($err | .[-600:])}'
+  rm -f "$err"
+}
+
+case "$1" in
+  json)
+    list=$(timeout 25 "$cs" list --json 2>/dev/null | jq -c . 2>/dev/null)
+    config=$(timeout 15 "$cs" config 2>/dev/null \
+      | awk '$1 ~ /^autoswitch\./ {sub(/^autoswitch\./, "", $1); printf "%s\t%s\n", $1, $2}' \
+      | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): (.[1] | tonumber? // .)}) | add // {}')
+    # Last engine poll (the threshold it actually runs with); `fromjson?` drops a half-written line.
+    poll=$(tail -n 400 "$log" 2>/dev/null | grep '"event": "poll"' | tail -n 1 | jq -Rc 'fromjson? // empty')
+    jq -nc --arg host "$(hostname -s)" --arg cswap "$cs" \
+      --arg active "$(systemctl --user is-active "$unit" 2>/dev/null)" \
+      --arg enabled "$(systemctl --user is-enabled "$unit" 2>/dev/null)" \
+      --arg load "$(systemctl --user show -p LoadState --value "$unit" 2>/dev/null)" \
+      --argjson list "${list:-null}" --argjson config "${config:-null}" --argjson poll "${poll:-null}" \
+      '{host: $host, cswapPath: $cswap, engine: $active, engineEnabled: $enabled, engineUnit: $load,
+        config: $config, list: $list, lastPoll: $poll} | .config //= {}'
+    ;;
+  switch)  wrap timeout 60 "$cs" switch "$2" --json ;;
+  best)    wrap timeout 60 "$cs" switch --strategy best --json ;;
+  threshold)
+    set_and_restart() {
+      "$cs" config set autoswitch.threshold "$1" || return
+      if systemctl --user is-active --quiet "$unit"; then systemctl --user restart "$unit"; fi
+    }
+    wrap set_and_restart "$2"
+    ;;
+  auto)
+    if [ "$2" = on ]; then
+      # The unit template arrives on stdin; install it only where it is missing.
+      template=$(cat)
+      auto_on() {
+        if [ "$(systemctl --user show -p LoadState --value "$unit")" = not-found ]; then
+          [ -n "$template" ] || { echo "no unit template to install" >&2; return 1; }
+          mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/state/claude-swap" || return
+          printf '%s\n' "${template//@CSWAP@/$cs}" > "$HOME/.config/systemd/user/$unit" || return
+          systemctl --user daemon-reload || return
+          echo "installed ~/.config/systemd/user/$unit"
+        fi
+        systemctl --user enable --now "$unit"
+      }
+      wrap auto_on
+    else
+      wrap systemctl --user disable --now "$unit"
+    fi
+    ;;
+  disable|enable) wrap timeout 30 "$cs" "$1" "$2" ;;
+  remove)
+    # The CLI asks "[y/N]"; answer it (the panel's two-click guard is the real
+    # confirmation). cswap still refuses while a live session uses the account.
+    remove_yes() { printf 'y\n' | timeout 30 "$cs" remove "$1"; }
+    wrap remove_yes "$2"
+    ;;
+  add)
+    # Snapshot this machine's current Claude Code login; stdin closed so any
+    # "overwrite slot?" question answers itself with no.
+    add_current() {
+      timeout 60 "$cs" add </dev/null >&2 || return
+      timeout 30 "$cs" status --json | jq -c '{email: .active.email, number: .active.number}'
+    }
+    wrap add_current
+    ;;
+  add-token)
+    token=$(cat)
+    if [ -n "$2" ]; then wrap timeout 60 "$cs" add-token - --email "$2" <<<"$token"
+    else wrap timeout 60 "$cs" add-token - <<<"$token"; fi
+    ;;
+  export)  timeout 30 "$cs" export - --account "$2" ;;
+  import)  wrap timeout 60 "$cs" import - ;;
+  *) echo '{"code":2,"result":null,"out":"","err":"unknown target command"}' ;;
+esac
+EOF
+
+# ---------------------------------------------------------------------------
+name_of() { [[ $1 == local ]] && echo "$LOCAL_NAME" || echo "$1"; }
+
+host_of() {   # machine name or host -> host spec
+  local m
+  for m in "${MACHINES[@]}"; do
+    [[ $1 == "$m" || $1 == "$(name_of "$m")" ]] && { echo "$m"; return 0; }
+  done
+  return 1
+}
+
+# run_on <host> <target args...>: stdin passes through to the target.
+run_on() {
+  local host=$1; shift
+  if [[ $host == local ]]; then
+    bash -c "$TARGET" cswap-bar "$@"
+  else
+    ssh -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ControlMaster=auto -o ControlPersist=10m \
+      -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/cswap-bar-%C" \
+      -- "$host" "$(printf '%q ' bash -c "$TARGET" cswap-bar "$@")"
+  fi
+}
+
+# fanout <stdin-text> <target args...>: run on every machine in parallel and
+# print {machines: [{machine, host, data, err}]}; data is null when the
+# machine could not be reached.
+fanout() {
+  local input=$1; shift
+  local tmp i m
+  tmp=$(mktemp -d)
+  for i in "${!MACHINES[@]}"; do
+    m=${MACHINES[$i]}
+    ( run_on "$m" "$@" <<<"$input" >"$tmp/$i.out" 2>"$tmp/$i.err" ) &
+  done
+  wait
+  for i in "${!MACHINES[@]}"; do
+    m=${MACHINES[$i]}
+    jq -nc --arg machine "$(name_of "$m")" --arg host "$m" \
+      --rawfile out "$tmp/$i.out" --rawfile err "$tmp/$i.err" \
+      '{machine: $machine, host: $host, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
+  done | jq -sc '{machines: .}'
+  rm -rf "$tmp"
+}
+
+# one <host> <target args...>: the same record for a single machine.
+one() {
+  local host=$1; shift
+  local out err
+  err=$(mktemp)
+  out=$(run_on "$host" "$@" </dev/null 2>"$err")
+  jq -nc --arg machine "$(name_of "$host")" --arg host "$host" --arg out "$out" --rawfile err "$err" \
+    '{machine: $machine, host: $host, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
+  rm -f "$err"
+}
+
+# copy_out <email>: stream the account from this machine to every other one
+# (`cswap import` skips a machine that already has it). The credential only
+# travels through a pipe, never a file outside claude-swap's own store.
+copy_out() {
+  local email=$1 m out err
+  for m in "${MACHINES[@]}"; do
+    [[ $m == local ]] && continue
+    err=$(mktemp)
+    out=$(run_on local export "$email" </dev/null 2>"$err" | run_on "$m" import 2>>"$err")
+    jq -nc --arg machine "$(name_of "$m")" --arg host "$m" --arg out "$out" --rawfile err "$err" \
+      '{machine: $machine, host: $host, copied: true, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
+    rm -f "$err"
+  done
+}
+
+usage() { echo "usage: cswap-bar [--machines a,b] [--local-name n] json|switch <email>|best|only <machine> <email>|threshold <pct>|auto on|off|disable <email>|enable <email>|remove <email>|add-login|copy <email>|add-token [email]" >&2; exit 2; }
+
+# refuse <message>: an action result the panel shows as an error line.
+refuse() {
+  jq -nc --arg msg "$1" '{machines: [{machine: "refused", host: "", err: "",
+    data: {code: 1, result: {error: {message: $msg}}, out: "", err: ""}}]}'
+  exit 1
+}
+
+cmd=${1:-}; shift || true
+case "$cmd" in
+  json)
+    fanout "" json
+    ;;
+  switch|disable|enable|remove)
+    valid_account "${1:-}" || usage
+    fanout "" "$cmd" "$1"
+    ;;
+  only)
+    h=$(host_of "${1:-}") || usage
+    valid_account "${2:-}" || usage
+    one "$h" switch "$2" | jq -sc '{machines: .}'
+    ;;
+  best)
+    # One machine decides, so every machine lands on the same account.
+    first=${MACHINES[0]}
+    rec=$(one "$first" best)
+    email=$(jq -r '.data.result.to.email // empty' <<<"$rec")
+    valid_account "$email" || email=""
+    {
+      echo "$rec"
+      if [[ -n $email ]]; then
+        for m in "${MACHINES[@]:1}"; do one "$m" switch "$email" & done
+        wait
+      fi
+    } | jq -sc '{machines: .}'
+    ;;
+  threshold)
+    [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || usage
+    fanout "" threshold "$1"
+    ;;
+  auto)
+    case "${1:-}" in
+      on)  fanout "$(cat "$HERE/systemd/claude-swap-auto.service" 2>/dev/null)" auto on ;;
+      off) fanout "" auto off ;;
+      *)   usage ;;
+    esac
+    ;;
+  add-login)
+    host_of local >/dev/null || refuse "Logins can only be added from this machine, and it is not in the machine list"
+    rec=$(one local add)
+    email=$(jq -r '.data.result.email // empty' <<<"$rec")
+    valid_account "$email" || email=""
+    { echo "$rec"; [[ -n $email ]] && copy_out "$email"; } | jq -sc '{machines: .}'
+    ;;
+  copy)
+    valid_account "${1:-}" || usage
+    host_of local >/dev/null || refuse "Accounts are only copied from this machine, and it is not in the machine list"
+    copy_out "$1" | jq -sc '{machines: .}'
+    ;;
+  add-token)
+    token=$(cat)
+    [[ -n $token ]] || { echo "add-token: token expected on stdin" >&2; exit 2; }
+    [[ -z ${1:-} ]] || valid_account "$1" || usage
+    fanout "$token" add-token "${1:-}"
+    ;;
+  *) usage ;;
+esac

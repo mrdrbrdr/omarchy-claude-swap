@@ -1,0 +1,29 @@
+# claude-swap auto-rotation (installed by the omarchy-claude-swap bar plugin)
+# Runs `cswap auto`, which polls every managed account's usage and switches the
+# shared Claude Code login when the active account reaches the threshold.
+# Threshold, interval and model come from claude-swap's settings.json
+# (`cswap config`); no flags here, so the bar plugin can change them.
+# @CSWAP@ is replaced with the path of the cswap binary at install time.
+[Unit]
+Description=claude-swap: auto-rotate Claude Code accounts
+Documentation=https://github.com/realiti4/claude-swap
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Always rotate the default ~/.claude login, never a per-account profile
+# that might leak in from the environment.
+UnsetEnvironment=CLAUDE_CONFIG_DIR
+Environment=PYTHONUNBUFFERED=1
+ExecStart=@CSWAP@ auto --json
+# One JSON event per line; the plugin reads the threshold back from here.
+# (The installer creates ~/.local/state/claude-swap: systemd opens these
+# files before any Exec line runs.)
+StandardOutput=append:%h/.local/state/claude-swap/auto.jsonl
+StandardError=append:%h/.local/state/claude-swap/auto.stderr.log
+Restart=always
+RestartSec=30
+
+[Install]
+WantedBy=default.target

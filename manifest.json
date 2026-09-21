@@ -1,0 +1,47 @@
+{
+  "schemaVersion": 1,
+  "id": "mrdrbrdr.claude-swap",
+  "name": "Claude Swap",
+  "version": "1.0.0",
+  "author": "mrdrbrdr",
+  "license": "MIT",
+  "description": "claude-swap in the Omarchy bar: which Claude Code account is active, every account's limits, one-click switching, the auto-switch threshold and on/off, and account management. Can drive several machines at once over ssh.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Claude Swap",
+    "description": "Bar icon with the active Claude account and its fullest limit; dropdown with every account's 5-hour, weekly and model meters, switch buttons, auto-switch toggle and threshold, and account management",
+    "category": "AI",
+    "aliases": [
+      "cswap",
+      "claude-swap",
+      "claude accounts"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "machines": "local",
+      "localName": ""
+    },
+    "schema": [
+      {
+        "key": "machines",
+        "type": "string",
+        "label": "Machines",
+        "defaultValue": "local",
+        "description": "Comma-separated machines to drive together: \"local\" is this computer, anything else an ssh destination with key login (e.g. \"server,local\"). The first one is primary: its slot numbers, threshold and best pick are the ones used."
+      },
+      {
+        "key": "localName",
+        "type": "string",
+        "label": "Name for this machine",
+        "defaultValue": "",
+        "description": "Label shown for this computer when several machines are driven. Empty = its hostname."
+      }
+    ]
+  }
+}
