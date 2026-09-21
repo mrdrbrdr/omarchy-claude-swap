@@ -15,6 +15,13 @@
 #   add-login               add THIS machine's current Claude Code login, copy it to the rest
 #   copy <email>            copy an account from THIS machine to the machines missing it
 #   add-token [email]       setup-token / API key on stdin, added everywhere
+#   fallback <email>        switch everywhere when claude-swap itself is stuck:
+#                           every account is past the threshold on a per-model
+#                           limit, so `cswap auto` refuses to move, while the
+#                           active account is hard blocked and this one still
+#                           has a free session window. Rate limited to one per
+#                           FALLBACK_COOLDOWN seconds across all callers, and
+#                           it posts a desktop notification.
 #
 # Machines: "local" is this machine; anything else is an ssh destination
 # reached with BatchMode (key auth, no prompts) and its own ControlMaster
@@ -225,6 +232,32 @@ copy_out() {
   done
 }
 
+FALLBACK_COOLDOWN=900
+fallback_state="${XDG_STATE_HOME:-$HOME/.local/state}/cswap-bar"
+
+# fallback <email>: one automatic switch per cooldown, whoever asks. The lock
+# makes concurrent bar instances agree; the stamp survives a shell restart.
+fallback() {
+  local email=$1 now last out
+  mkdir -p "$fallback_state" 2>/dev/null
+  exec 9>"$fallback_state/fallback.lock" || refuse "cannot lock"
+  flock -n 9 || refuse "another fallback is running"
+  now=$(date +%s)
+  last=$(cat "$fallback_state/fallback.stamp" 2>/dev/null || echo 0)
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  if (( now - last < FALLBACK_COOLDOWN )); then
+    refuse "automatic switch is on cooldown ($(( (FALLBACK_COOLDOWN - now + last) / 60 + 1 )) min left)"
+  fi
+  echo "$now" > "$fallback_state/fallback.stamp"
+  out=$(fanout "" switch "$email")
+  printf '%s\n' "$out"
+  if [[ $(jq -r '[.machines[] | select(.data.code == 0)] | length' <<<"$out") -gt 0 ]]; then
+    command -v notify-send >/dev/null &&
+      notify-send -a "Claude accounts" "Switched to $email" \
+        "Every account was past the limit claude-swap watches; this one still had a free session window." || true
+  fi
+}
+
 usage() { echo "usage: cswap-bar [--machines a,b] [--local-name n] json|switch <email>|best|only <machine> <email>|threshold <pct>|auto on|off|disable <email>|enable <email>|remove <email>|add-login|copy <email>|add-token [email]" >&2; exit 2; }
 
 # refuse <message>: an action result the panel shows as an error line.
@@ -284,6 +317,10 @@ case "$cmd" in
     valid_account "${1:-}" || usage
     host_of local >/dev/null || refuse "Accounts are only copied from this machine, and it is not in the machine list"
     copy_out "$1" | jq -sc '{machines: .}'
+    ;;
+  fallback)
+    valid_account "${1:-}" || usage
+    fallback "$1"
     ;;
   add-token)
     token=$(cat)

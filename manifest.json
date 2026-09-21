@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mrdrbrdr.claude-swap",
   "name": "Claude Swap",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "author": "mrdrbrdr",
   "license": "MIT",
   "description": "claude-swap in the Omarchy bar: which Claude Code account is active, every account's limits, one-click switching, the auto-switch threshold and on/off, and account management. Can drive several machines at once over ssh.",
@@ -25,7 +25,8 @@
     "defaultSection": "right",
     "defaults": {
       "machines": "local",
-      "localName": ""
+      "localName": "",
+      "autoFallback": true
     },
     "schema": [
       {
@@ -41,6 +42,13 @@
         "label": "Name for this machine",
         "defaultValue": "",
         "description": "Label shown for this computer when several machines are driven. Empty = its hostname."
+      },
+      {
+        "key": "autoFallback",
+        "type": "boolean",
+        "label": "Switch automatically when everything is blocked",
+        "defaultValue": true,
+        "description": "When every account is past the threshold on a per-model limit, claude-swap stops switching. If the active account is then fully out of session quota and another account still has a free session window, move there anyway (at most once every 15 minutes, with a notification)."
       }
     ]
   }

@@ -28,6 +28,8 @@ Panel {
   readonly property string glyph: "󰀙"
   readonly property string machinesSetting: String(setting("machines", "local")).replace(/\s+/g, "")
   readonly property string localName: String(setting("localName", ""))
+  // Automatic rescue switch: see autoFallbackTarget().
+  readonly property bool autoFallback: setting("autoFallback", true) === true
   readonly property string helper: String(Qt.resolvedUrl("cswap-bar")).replace(/^file:\/\//, "")
   readonly property var helperBase: [helper, "--machines", machinesSetting]
     .concat(localName !== "" ? ["--local-name", localName] : [])
@@ -60,6 +62,7 @@ Panel {
   property int pendingThreshold: -1
   property bool thresholdSettling: false
   property bool manageOpen: false
+  property string fallbackNote: ""
   property string pendingStdin: ""
 
   // ---------------------------------------------------------------- derived
@@ -187,6 +190,44 @@ Panel {
     return out
   }
 
+  // Session + weekly only: what stops EVERY model, ignoring per-model limits.
+  function accountWidePct(a) {
+    var u = a && a.usage ? a.usage : null
+    if (!u) return -1
+    var out = -1
+    if (u.fiveHour && Number(u.fiveHour.pct) > out) out = Number(u.fiveHour.pct)
+    if (u.sevenDay && Number(u.sevenDay.pct) > out) out = Number(u.sevenDay.pct)
+    return out
+  }
+
+  // The rescue claude-swap will not do for itself. Its engine folds the
+  // per-model weekly limits into every decision, so when that model is spent
+  // on every account it reports "all exhausted" and sits still, even while the
+  // active account is hard blocked and another one has a free session window
+  // that other models could use. Returns that account, or null.
+  function autoFallbackTarget() {
+    if (!autoFallback || actionProc.running || !primaryActive) return null
+    // Does claude-swap still have a move of its own? Then leave it alone.
+    var margin = 100 - threshold
+    for (var i = 0; i < accounts.length; i++) {
+      var a = accounts[i]
+      if (a.disabledOn.length > 0) continue
+      if (100 - bindingPct(a) > margin) return null
+    }
+    // Only when staying put means not working at all.
+    if (accountWidePct(primaryActive) < 99) return null
+    var best = null
+    for (var j = 0; j < accounts.length; j++) {
+      var c = accounts[j]
+      if (c.email === primaryActive.email || c.disabledOn.length > 0) continue
+      if (c.on.length < reachable.length) continue          // not stored everywhere
+      var pct = accountWidePct(c)
+      if (pct < 0 || pct >= 99) continue                    // no session room either
+      if (!best || pct < accountWidePct(best)) best = c
+    }
+    return best
+  }
+
   // The fullest window is the one that stops the next prompt.
   function bindingPct(a) {
     var windows = limitsOf(a)
@@ -307,6 +348,12 @@ Panel {
       var prev = previous[m.machine]
       return { machine: m.machine, host: m.host, data: prev ? prev.data : null, unreachable: true, err: m.err || "" }
     })
+    var rescue = autoFallbackTarget()
+    if (rescue) {
+      fallbackNote = ""
+      runAction(["fallback", rescue.email],
+                "Everything is past the limit; moving to #" + rescue.number + ", which still has a session window…")
+    }
     // A written threshold shows as pending until a poll after the write reads it back.
     if (thresholdSettling && !applyTimer.running && !actionProc.running) {
       thresholdSettling = false
@@ -352,6 +399,11 @@ Panel {
       })
     }
     if (actionKind === "threshold") thresholdSettling = true
+    if (actionKind === "fallback") {
+      var refused = lines.length === 1 && lines[0].bad && lines[0].text.indexOf("cooldown") >= 0
+      fallbackNote = refused ? lines[0].text : ""
+      if (refused) lines = []
+    }
     actionLines = lines
     actionLabel = ""
     pendingStdin = ""

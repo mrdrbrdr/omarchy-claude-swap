@@ -7,6 +7,7 @@ A bar widget for [Omarchy](https://omarchy.org) that puts [claude-swap](https://
 - **Switch** to any account, or let **Best pick** choose the one with the most room left. Switches ask for a second click.
 - **Auto-switch:** turn `cswap auto` on or off and set the threshold with − / +.
 - **Manage accounts:** add the account Claude Code is logged in to, add a setup token or API key, hold an account out of rotation, remove one.
+- **Rescue switch:** when claude-swap itself gets stuck, the widget switches for you. See below.
 - **Several machines (optional):** drive your desktop and, say, a server where your agents run, as one.
 
 Mouse only. Left-click opens the panel, middle-click refreshes, right-click opens the full `cswap` TUI in a terminal.
@@ -31,6 +32,20 @@ Update later with `omarchy plugin update mrdrbrdr.claude-swap`, then run `omarch
 2. Open the widget. With no accounts yet, the **Manage accounts** section is already open. Click **Add this machine's login**.
 3. For each further account, run `/login` in Claude Code, log in as that account, and click **Add this machine's login** again.
 4. Turn on **Rotate automatically**. The first time, this installs `~/.config/systemd/user/claude-swap-auto.service`, which runs `cswap auto`. Set the threshold with − / +.
+
+## The rescue switch
+
+claude-swap can watch a per-model weekly limit as well (`cswap config set autoswitch.model Fable`), which is useful: it moves you off an account whose model quota is gone while its session window still looks fine. But when that model is spent on *every* account, its engine reports "all exhausted" and stops switching, even when the account you are on has no session quota left at all and another account has a fresh session window that every other model could use.
+
+This widget fills that gap. Once per poll it checks whether all of this is true:
+
+- claude-swap has no move of its own, meaning every account is past the threshold on the limits it watches
+- the active account is out of session quota (its 5-hour or weekly limit is at 99% or more), so staying means not working
+- another account, stored on every machine and not held out of rotation, still has session room
+
+Then it switches there, on every machine, and posts a desktop notification. At most one such switch every 15 minutes, which holds across bar instances and shell restarts.
+
+Turn it off with the **Switch automatically when everything is blocked** setting (`"autoFallback": false`). Note that it also applies when you switch to a spent account by hand: within a minute it moves you back off, because that account cannot serve a prompt.
 
 ## Several machines
 
