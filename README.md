@@ -2,6 +2,8 @@
 
 A bar widget for [Omarchy](https://omarchy.org) that puts [claude-swap](https://github.com/realiti4/claude-swap) (multi-account switching for Claude Code) one click away. It replaces keeping the `cswap` TUI open in a terminal.
 
+![The Claude Swap panel open from the Omarchy bar, with three accounts and their limits](preview.png)
+
 - **Bar:** the active account and how full its fullest limit is, for example `󰀙 1 72%`. It turns your theme's alert color when that limit reaches the auto-switch threshold or when something needs attention.
 - **Dropdown:** every account's 5-hour, weekly and per-model meters with the time to reset. Each meter has a tick for an even pace through the window and one for the switch threshold. Hover a row for details.
 - **Switch** to any account. Switches ask for a second click to confirm.
