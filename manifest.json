@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "mrdrbrdr.claude-swap",
   "name": "Claude Swap",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "author": "mrdrbrdr",
   "license": "MIT",
-  "description": "claude-swap in the Omarchy bar: which Claude Code account is active, every account's limits, one-click switching, the auto-switch threshold and on/off, and account management. Can drive several machines at once over ssh.",
+  "description": "Run several Claude Code accounts from the Omarchy bar: live 5-hour, weekly and per-model limits for each, one-click switching, and control over claude-swap's automatic rotation, with a rescue switch for when it gets stuck. Can drive several machines at once over ssh.",
   "kinds": [
     "bar-widget"
   ],
@@ -34,7 +34,7 @@
         "type": "string",
         "label": "Machines",
         "defaultValue": "local",
-        "description": "Comma-separated machines to drive together: \"local\" is this computer, anything else an ssh destination with key login (e.g. \"server,local\"). The first one is primary: its slot numbers, threshold and best pick are the ones used."
+        "description": "Comma-separated machines to drive together: \"local\" is this computer, anything else an ssh destination with key login (e.g. \"server,local\"). The first one is primary: its slot numbers and threshold are the ones used."
       },
       {
         "key": "localName",

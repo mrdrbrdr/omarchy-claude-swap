@@ -6,10 +6,10 @@ import qs.Commons
 import qs.Ui
 
 // omarchy-claude-swap: bar icon + dropdown for claude-swap (Claude Code
-// multi-account switching), a mouse-driven stand-in for the `cswap` TUI.
+// multi-account switching).
 // Everything runs through ./cswap-bar. `json` is polled every 60 s (15 s while
 // the panel is open); cswap serves `list` from its shared usage cache, so this
-// adds no calls to the rate-limited usage endpoint. Actions: switch, best pick,
+// adds no calls to the rate-limited usage endpoint. Actions: switch,
 // threshold, auto-switch on/off, disable/enable, remove, add from this
 // machine's login or a setup token, copy.
 // Settings (shell.json): `machines` (default "local"; comma-separated ssh
@@ -17,8 +17,7 @@ import qs.Ui
 // for this machine, default its hostname).
 // Bar: 󰀙 <active account> <its fullest limit>%; "1|2" when machines are on
 // different accounts. Urgent color at the threshold or when something is wrong.
-// Left-click opens, middle-click refreshes, right-click opens the full TUI.
-// Switches, best pick and removals ask for a second click.
+// Left-click opens the panel. Switches and removals ask for a second click.
 // Open from scripts: omarchy-shell shell toggle mrdrbrdr.claude-swap
 Panel {
   id: root
@@ -429,10 +428,6 @@ Panel {
     armOrRun("switch:" + a.email, ["switch", a.email], (multi ? "Switching every machine to #" : "Switching to #") + a.number + "…")
   }
 
-  function requestBest() {
-    armOrRun("best", ["best"], "Picking the account with the most room…")
-  }
-
   function stepThreshold(delta) {
     var base = pendingThreshold >= 0 ? pendingThreshold : Math.round(threshold)
     pendingThreshold = clamp(base + delta, 50, 100)
@@ -443,16 +438,6 @@ Panel {
   function toggleAuto() {
     if (actionProc.running) return
     runAction(["auto", autoOn ? "off" : "on"], autoOn ? "Stopping auto-switch" + everywhereText + "…" : "Starting auto-switch" + everywhereText + "…")
-  }
-
-  function openTui() {
-    close()
-    var host = primary ? primary.host : "local"
-    var cswap = primary && primary.data && primary.data.cswapPath ? String(primary.data.cswapPath) : "cswap"
-    var cmd = host !== "local"
-      ? ["omarchy-launch-or-focus-tui", "--app-id=org.omarchy.cswap", "ssh", "-t", host, cswap]
-      : ["omarchy-launch-or-focus-tui", "--app-id=org.omarchy.cswap", cswap]
-    Util.execArgv(cmd)
   }
 
   Component.onCompleted: refresh()
@@ -519,11 +504,7 @@ Panel {
       if (root.issues.length) lines.push(root.issues[0].text)
       return lines.join("\n")
     }
-    onPressed: function(b) {
-      if (b === Qt.RightButton) root.openTui()
-      else if (b === Qt.MiddleButton) root.refresh()
-      else root.toggle()
-    }
+    onPressed: function(b) { if (b === Qt.LeftButton) root.toggle() }
   }
 
   KeyboardPanel {
@@ -664,56 +645,6 @@ Panel {
                 width: accountsSection.width
                 account: modelData
               }
-            }
-          }
-
-          // ---------- actions ----------
-          Row {
-            id: actionRow
-            width: parent.width
-            spacing: Style.space(6)
-            readonly property real cellWidth: (width - spacing * 2) / 3
-
-            Button {
-              width: actionRow.cellWidth
-              iconText: "󰁨"
-              iconSize: Style.font.title
-              text: root.armedKey === "best" ? "Confirm" : "Best pick"
-              tooltipText: (root.multi ? "Move every machine" : "Switch") + " to the account with the most room left"
-              fontSize: Style.font.bodySmall
-              foreground: root.armedKey === "best" ? root.urgent : root.foreground
-              fontFamily: root.fontFamily
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              bordered: true
-              opacity: actionProc.running || !root.primary ? 0.45 : 1
-              onClicked: root.requestBest()
-            }
-            Button {
-              width: actionRow.cellWidth
-              iconText: "󰑐"
-              iconSize: Style.font.title
-              iconSpinning: stateProc.running
-              text: "Refresh"
-              tooltipText: "Re-read claude-swap now"
-              fontSize: Style.font.bodySmall
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              bordered: true
-              onClicked: root.refresh()
-            }
-            Button {
-              width: actionRow.cellWidth
-              iconText: "󰆍"
-              iconSize: Style.font.title
-              text: "Full TUI"
-              tooltipText: "Open the cswap dashboard on " + (root.primary ? root.primary.machine : "the primary machine")
-              fontSize: Style.font.bodySmall
-              foreground: root.foreground
-              fontFamily: root.fontFamily
-              verticalPadding: Style.spacing.controlPaddingY + Style.space(2)
-              bordered: true
-              onClicked: root.openTui()
             }
           }
 

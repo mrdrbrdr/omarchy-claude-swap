@@ -4,13 +4,13 @@ A bar widget for [Omarchy](https://omarchy.org) that puts [claude-swap](https://
 
 - **Bar:** the active account and how full its fullest limit is, for example `󰀙 1 72%`. It turns your theme's alert color when that limit reaches the auto-switch threshold or when something needs attention.
 - **Dropdown:** every account's 5-hour, weekly and per-model meters with the time to reset. Each meter has a tick for an even pace through the window and one for the switch threshold. Hover a row for details.
-- **Switch** to any account, or let **Best pick** choose the one with the most room left. Switches ask for a second click.
+- **Switch** to any account. Switches ask for a second click to confirm.
 - **Auto-switch:** turn `cswap auto` on or off and set the threshold with − / +.
 - **Manage accounts:** add the account Claude Code is logged in to, add a setup token or API key, hold an account out of rotation, remove one.
 - **Rescue switch:** when claude-swap itself gets stuck, the widget switches for you. See below.
 - **Several machines (optional):** drive your desktop and, say, a server where your agents run, as one.
 
-Mouse only. Left-click opens the panel, middle-click refreshes, right-click opens the full `cswap` TUI in a terminal.
+Mouse only: left-click the bar icon to open the panel. It refreshes on its own.
 
 ## Requirements
 
@@ -25,6 +25,24 @@ omarchy plugin add https://github.com/mrdrbrdr/omarchy-claude-swap.git --enable
 ```
 
 Update later with `omarchy plugin update mrdrbrdr.claude-swap`, then run `omarchy restart shell`. The shell keeps an already loaded widget in memory, so updated code only shows after a restart.
+
+## Uninstall
+
+1. If you turned on **Rotate automatically**, turn it off in the panel first. That stops and disables `claude-swap-auto.service` on every machine the widget drives.
+2. Remove the widget:
+
+   ```bash
+   omarchy plugin remove mrdrbrdr.claude-swap
+   ```
+
+3. Optionally delete what the widget created on each machine:
+
+   ```bash
+   rm -f ~/.config/systemd/user/claude-swap-auto.service && systemctl --user daemon-reload
+   rm -rf ~/.local/state/cswap-bar
+   ```
+
+Your accounts stay in claude-swap's own store and keep working with the `cswap` CLI. To remove claude-swap as well, run `uv tool uninstall claude-swap`.
 
 ## First run
 
@@ -57,9 +75,9 @@ Point the widget at more than one machine in `~/.config/omarchy/shell.json`:
 
 or `omarchy bar set mrdrbrdr.claude-swap machines "server,local"`.
 
-- `local` is this computer. Anything else is an ssh destination. The first machine is primary: its slot numbers and threshold are shown, and Best pick is decided there.
+- `local` is this computer. Anything else is an ssh destination. The first machine is primary: its slot numbers and threshold are shown.
 - Each remote machine needs key-based ssh without prompts, `bash`, `jq` and claude-swap. On a headless server, run `loginctl enable-linger` there so the auto-switch service keeps running while you are logged out.
-- Switching, Best pick, the threshold, auto-switch on/off, disable/enable and remove apply to every machine. If the machines end up on different accounts, the panel says so and offers to bring them back in line.
+- Switching, the threshold, auto-switch on/off, disable/enable and remove apply to every machine. If the machines end up on different accounts, the panel says so and offers to bring them back in line.
 - **Accounts only travel outward from this computer.** "Add this machine's login" and "Copy to …" push this computer's stored login to the other machines. Nothing is ever imported from a remote machine, so a compromised server cannot plant an account on your desktop. Consider limiting the ssh key on the server to this computer's address, for example `from="100.x.y.z"` in its `authorized_keys`.
 
 ## How it works

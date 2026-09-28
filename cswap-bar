@@ -5,7 +5,6 @@
 # Usage: cswap-bar [--machines "local,server"] [--local-name NAME] <command> [args]
 #   json                    state of every machine (parallel)
 #   switch <email>          switch every machine to that account
-#   best                    best pick on the first machine, the others follow it
 #   only <machine> <email>  switch one machine (bring it back in line)
 #   threshold <pct>         autoswitch.threshold everywhere + restart running engines
 #   auto on|off             start/stop claude-swap-auto.service everywhere
@@ -107,7 +106,6 @@ case "$1" in
         config: $config, list: $list, lastPoll: $poll} | .config //= {}'
     ;;
   switch)  wrap timeout 60 "$cs" switch "$2" --json ;;
-  best)    wrap timeout 60 "$cs" switch --strategy best --json ;;
   threshold)
     set_and_restart() {
       "$cs" config set autoswitch.threshold "$1" || return
@@ -258,7 +256,7 @@ fallback() {
   fi
 }
 
-usage() { echo "usage: cswap-bar [--machines a,b] [--local-name n] json|switch <email>|best|only <machine> <email>|threshold <pct>|auto on|off|disable <email>|enable <email>|remove <email>|add-login|copy <email>|add-token [email]" >&2; exit 2; }
+usage() { echo "usage: cswap-bar [--machines a,b] [--local-name n] json|switch <email>|only <machine> <email>|threshold <pct>|auto on|off|disable <email>|enable <email>|remove <email>|add-login|copy <email>|add-token [email]" >&2; exit 2; }
 
 # refuse <message>: an action result the panel shows as an error line.
 refuse() {
@@ -280,20 +278,6 @@ case "$cmd" in
     h=$(host_of "${1:-}") || usage
     valid_account "${2:-}" || usage
     one "$h" switch "$2" | jq -sc '{machines: .}'
-    ;;
-  best)
-    # One machine decides, so every machine lands on the same account.
-    first=${MACHINES[0]}
-    rec=$(one "$first" best)
-    email=$(jq -r '.data.result.to.email // empty' <<<"$rec")
-    valid_account "$email" || email=""
-    {
-      echo "$rec"
-      if [[ -n $email ]]; then
-        for m in "${MACHINES[@]:1}"; do one "$m" switch "$email" & done
-        wait
-      fi
-    } | jq -sc '{machines: .}'
     ;;
   threshold)
     [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || usage
