@@ -2,10 +2,10 @@
   "schemaVersion": 1,
   "id": "mrdrbrdr.claude-swap",
   "name": "Claude Swap",
-  "version": "1.3.0",
+  "version": "1.3.1",
   "author": "mrdrbrdr",
   "license": "MIT",
-  "description": "Run several Claude Code accounts from the Omarchy bar: live 5-hour, weekly and per-model limits for each, one-click switching, and control over claude-swap's automatic rotation, with a rescue switch for when it gets stuck. Can drive several machines at once over ssh.",
+  "description": "Automatic account switching for Claude Code, right in your Omarchy bar. Hit 90% on one account and Claude Swap quietly moves you to the next. It just works!",
   "kinds": [
     "bar-widget"
   ],

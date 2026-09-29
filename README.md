@@ -1,6 +1,8 @@
 # Claude Swap for Omarchy
 
-A bar widget for [Omarchy](https://omarchy.org) that puts [claude-swap](https://github.com/realiti4/claude-swap) (multi-account switching for Claude Code) one click away. It replaces keeping the `cswap` TUI open in a terminal.
+Automatic account switching for Claude Code, right in your [Omarchy](https://omarchy.org) bar. Hit 90% on one account and Claude Swap quietly moves you to the next. It just works!
+
+It is a bar widget for [claude-swap](https://github.com/realiti4/claude-swap), which does the actual account work. The threshold is yours to set; 90% is the default.
 
 ![The Claude Swap panel open from the Omarchy bar, with three accounts and their limits](preview.png)
 
