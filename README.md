@@ -78,7 +78,7 @@ Point the widget at more than one machine in `~/.config/omarchy/shell.json`:
 or `omarchy bar set mrdrbrdr.claude-swap machines "server,local"`.
 
 - `local` is this computer. Anything else is an ssh destination. The first machine is primary: its slot numbers and threshold are shown.
-- Each remote machine needs key-based ssh without prompts, `bash`, `jq` and claude-swap. On a headless server, run `loginctl enable-linger` there so the auto-switch service keeps running while you are logged out.
+- Each remote machine needs key-based ssh without prompts, a bash or zsh login shell, `jq` and claude-swap. On a headless server, run `loginctl enable-linger` there so the auto-switch service keeps running while you are logged out.
 - Switching, the threshold, auto-switch on/off, disable/enable and remove apply to every machine. If the machines end up on different accounts, the panel says so and offers to bring them back in line.
 - **Accounts only travel outward from this computer.** "Add this machine's login" and "Copy to …" push this computer's stored login to the other machines. Nothing is ever imported from a remote machine, so a compromised server cannot plant an account on your desktop. Consider limiting the ssh key on the server to this computer's address, for example `from="100.x.y.z"` in its `authorized_keys`.
 
@@ -90,6 +90,9 @@ or `omarchy bar set mrdrbrdr.claude-swap machines "server,local"`.
 - Polling runs every 60 s, and every 15 s while the panel is open. claude-swap answers from its own usage cache, so the widget adds no calls to Anthropic's rate-limited usage endpoint.
 - Setup tokens go to claude-swap on stdin, never on a command line. Account copies stream through ssh and are never written to a file outside claude-swap's own store.
 - Machine names and account ids are checked against plain patterns before they reach `ssh` or `cswap`.
+- Every answer is held to a size ceiling as it arrives, before it reaches the shell, `jq` or the panel: 32 KiB per command on each machine, 96 KiB per machine, 1 MiB in total, at most 8 machines. A larger answer is dropped and reported, never cut short.
+- **Rotate automatically** creates `~/.config/systemd/user/claude-swap-auto.service` only when nothing is at that path, and never follows or replaces a symlink there. The toggle only starts or stops a unit this widget installed. If you wrote your own unit under that name, it is left alone and you manage it with `systemctl --user`.
+- The rescue switch keeps its timestamp in `~/.local/state/cswap-bar`, a private directory (mode 0700) that is checked on every use and refused if it is a symlink or not yours.
 
 ## Good to know
 

@@ -8,7 +8,9 @@
 #   only <machine> <email>  switch one machine (bring it back in line)
 #   threshold <pct>         autoswitch.threshold everywhere + restart running engines
 #   auto on|off             start/stop claude-swap-auto.service everywhere
-#                           (`on` installs the unit from ./systemd first where missing)
+#                           (`on` installs the unit from ./systemd first where
+#                           nothing is at its path; only a unit this plugin
+#                           installed is ever started or stopped)
 #   disable|enable <email>  hold an account out of / return it to auto-rotation
 #   remove <email>          remove the account everywhere
 #   add-login               add THIS machine's current Claude Code login, copy it to the rest
@@ -33,6 +35,12 @@
 # (cswap arguments) are checked against plain patterns so neither can be read
 # as an option. Tokens travel on stdin, never on a command line.
 #
+# Size limits: every answer is held to a byte ceiling on its way IN, before it
+# reaches a shell variable, a file of any size, jq or the panel: CAP per command
+# on each machine, MACHINE_MAX per machine here, FINAL_MAX for everything the
+# panel reads. An answer over its ceiling is dropped whole and reported, never
+# truncated into something that could still parse.
+#
 # `cswap list --json` is served from claude-swap's shared usage store (it only
 # refetches entries older than its freshness floor), so polling adds no calls
 # to the rate-limited usage endpoint.
@@ -41,6 +49,12 @@ set -o pipefail
 export PATH="$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin"
 
 HERE=$(cd "$(dirname "$0")" && pwd)
+MACHINE_MAX=98304   # one machine's answer (its `json` is ~1 KiB per account)
+ERR_MAX=4096        # stderr kept from any command
+FINAL_MAX=1048576   # everything printed for the panel
+MAX_MACHINES=8
+INPUT_MAX=16384     # a unit template or a setup token read from stdin
+
 machines="local"
 LOCAL_NAME=""
 while [[ ${1:-} == --* ]]; do
@@ -55,10 +69,17 @@ IFS=, read -r -a MACHINES <<<"$machines"
 
 valid_machine() { [[ $1 == local || $1 =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]]; }
 valid_account() { [[ $1 =~ ^[A-Za-z0-9._%+][A-Za-z0-9._%+-]*@[A-Za-z0-9][A-Za-z0-9.-]*$ ]]; }
+(( ${#MACHINES[@]} <= MAX_MACHINES )) || { echo "cswap-bar: at most $MAX_MACHINES machines" >&2; exit 2; }
 for m in "${MACHINES[@]}"; do
   valid_machine "$m" || { echo "cswap-bar: refusing machine name: $m" >&2; exit 2; }
 done
 [[ $LOCAL_NAME =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || LOCAL_NAME=local
+
+# Every temp file of this run lives in one private directory, removed on any
+# exit, including when the panel stops a slow run.
+WORK=$(mktemp -d) || exit 1
+trap 'rm -rf "$WORK"' EXIT
+trap 'exit 143' TERM INT HUP
 
 # ---------------------------------------------------------------------------
 # Runs on each machine. Every command prints exactly one JSON object, except
@@ -66,38 +87,122 @@ done
 read -r -d '' TARGET <<'EOF'
 export NO_COLOR=1
 export PATH="$HOME/.local/bin:$PATH"
+CAP=32768
+IN_MAX=16384
+# Temp files live in one private directory that goes away however this ends.
+W=$(mktemp -d) || exit 1
+trap 'rm -rf "$W"' EXIT
+trap 'exit 143' TERM INT HUP
+host=$(hostname -s 2>/dev/null || uname -n)
 unit=claude-swap-auto.service
+unit_dir="${XDG_CONFIG_HOME:-$HOME/.config}/systemd/user"
+unit_path="$unit_dir/$unit"
+# First line of ./systemd/claude-swap-auto.service: how a unit this plugin
+# installed is told apart from one the user wrote.
+marker="# claude-swap auto-rotation (installed by the omarchy-claude-swap bar plugin)"
 log="$HOME/.local/state/claude-swap/auto.jsonl"
 if ! command -v jq >/dev/null 2>&1; then
-  printf '{"error":"jq is not installed on %s"}\n' "$(hostname -s)"; exit 0
+  printf '{"error":"jq is not installed on %s"}\n' "$host"; exit 0
 fi
 cs=$(command -v cswap)
 if [ -z "$cs" ]; then
-  jq -nc --arg h "$(hostname -s)" \
+  jq -nc --arg h "$host" \
     '{error: ("claude-swap is not installed on " + $h + " (uv tool install claude-swap)"),
       code: 127, result: {error: {message: ("claude-swap is not installed on " + $h)}}}'
   exit 0
 fi
 
-# wrap <cmd...>: one line {code, result, out, err}; result = stdout as JSON when it is JSON.
+# cap: pass stdin through only when it fits in CAP bytes; otherwise print
+# nothing, which every caller reads as "no answer".
+cap() {
+  local f
+  f=$(mktemp -p "$W") || return 1
+  head -c $((CAP + 1)) >"$f"
+  [ "$(wc -c <"$f")" -le "$CAP" ] && cat "$f"
+  rm -f "$f"
+}
+
+# wrap <cmd...>: one line {code, result, out, err}; result = stdout as JSON
+# when it is JSON. stdout is held to CAP bytes as it arrives and dropped whole
+# when larger. Only the first 4 KiB of stderr is kept, but all of it is read,
+# so a chatty command is never killed by a closed pipe.
 wrap() {
-  local err out code
-  err=$(mktemp)
-  out=$("$@" 2>"$err"); code=$?
-  jq -nc --argjson code "$code" --arg out "$out" --rawfile err "$err" \
+  local out err st code
+  out=$(mktemp -p "$W") && err=$(mktemp -p "$W") && st=$(mktemp -p "$W") || return 1
+  { { "$@"; echo $? >"$st"; } 2>&1 >&3 3>&- | { head -c 4096 >"$err"; cat >/dev/null; }; } 3>&1 | head -c $((CAP + 1)) >"$out"
+  code=$(cat "$st")
+  case $code in ''|*[!0-9]*) code=1 ;; esac
+  if [ "$(wc -c <"$out")" -gt "$CAP" ]; then
+    code=1; : >"$out"; echo "output larger than $CAP bytes, ignored" >"$err"
+  fi
+  jq -nc --argjson code "$code" --rawfile out "$out" --rawfile err "$err" \
     '{code: $code, result: ($out | fromjson? // null), out: ($out | .[-600:]), err: ($err | .[-600:])}'
-  rm -f "$err"
+  rm -f "$out" "$err" "$st"
+}
+
+# frag: the file systemd loads the unit from (empty when there is none).
+# Fails with a message when `systemctl --user` does not work here at all.
+frag() {
+  local p
+  if ! p=$(systemctl --user show -p FragmentPath --value "$unit" 2>&1); then
+    echo "systemctl --user does not work on $host (no user session there? loginctl enable-linger): $p" >&2
+    return 1
+  fi
+  printf '%s\n' "$p"
+}
+
+# ours: the unit systemd runs is the file at unit_path (same inode), a regular
+# file (not a symlink) owned by us whose first line is this plugin's marker.
+# Only then does `auto on|off` or `threshold` start, stop or restart it; a unit
+# someone else wrote is left alone. 0 = ours, 1 = not ours, 2 = cannot tell.
+ours() {
+  local f
+  f=$(frag) || return 2
+  [ ! -L "$unit_path" ] && [ -f "$unit_path" ] && [ -O "$unit_path" ] &&
+    [ "$(head -c 200 "$unit_path" | head -n 1)" = "$marker" ] &&
+    [ -n "$f" ] && [ "$f" -ef "$unit_path" ] && return 0
+  return 1
+}
+
+# must_be_ours: ours, or say why not and fail.
+must_be_ours() {
+  ours
+  case $? in
+    0) return 0 ;;
+    2) return 1 ;;
+    *) echo "$unit on this machine was not installed by this widget, so it is left alone; start or stop it with systemctl --user" >&2
+       return 1 ;;
+  esac
+}
+
+# install_unit: create unit_path from the template, only where nothing is at
+# that path. The file is written under a fresh mktemp name in the same
+# directory, then hard-linked into place: link() fails if the path exists in
+# any form, a dangling symlink included, and never follows one.
+install_unit() {
+  local tmp rc
+  [ "$(printf '%s\n' "$template" | head -n 1)" = "$marker" ] || { echo "no valid unit template" >&2; return 1; }
+  mkdir -p "$unit_dir" "$HOME/.local/state/claude-swap" || return
+  [ -d "$unit_dir" ] && [ -O "$unit_dir" ] || { echo "$unit_dir is not a directory you own" >&2; return 1; }
+  tmp=$(mktemp "$unit_dir/.$unit.XXXXXX") || return
+  printf '%s\n' "${template//@CSWAP@/"$cs"}" >"$tmp" && chmod 644 "$tmp" && ln -T -- "$tmp" "$unit_path"
+  rc=$?
+  rm -f -- "$tmp"
+  [ "$rc" -eq 0 ] || { echo "could not create $unit_path" >&2; return 1; }
+  systemctl --user daemon-reload || return
+  echo "installed $unit_path"
 }
 
 case "$1" in
   json)
-    list=$(timeout 25 "$cs" list --json 2>/dev/null | jq -c . 2>/dev/null)
-    config=$(timeout 15 "$cs" config 2>/dev/null \
+    list=$(timeout 25 "$cs" list --json 2>/dev/null | cap | jq -c . 2>/dev/null)
+    config=$(timeout 15 "$cs" config 2>/dev/null | cap \
       | awk '$1 ~ /^autoswitch\./ {sub(/^autoswitch\./, "", $1); printf "%s\t%s\n", $1, $2}' \
       | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]): (.[1] | tonumber? // .)}) | add // {}')
-    # Last engine poll (the threshold it actually runs with); `fromjson?` drops a half-written line.
-    poll=$(tail -n 400 "$log" 2>/dev/null | grep '"event": "poll"' | tail -n 1 | jq -Rc 'fromjson? // empty')
-    jq -nc --arg host "$(hostname -s)" --arg cswap "$cs" \
+    # Last engine poll (the threshold it actually runs with) from the log's
+    # tail; `fromjson?` drops a half-written line.
+    poll=$(tail -c "$CAP" "$log" 2>/dev/null | grep '"event": "poll"' | tail -n 1 | jq -Rc 'fromjson? // empty')
+    jq -nc --arg host "$host" --arg cswap "$cs" \
       --arg active "$(systemctl --user is-active "$unit" 2>/dev/null)" \
       --arg enabled "$(systemctl --user is-enabled "$unit" 2>/dev/null)" \
       --arg load "$(systemctl --user show -p LoadState --value "$unit" 2>/dev/null)" \
@@ -108,28 +213,36 @@ case "$1" in
   switch)  wrap timeout 60 "$cs" switch "$2" --json ;;
   threshold)
     set_and_restart() {
-      "$cs" config set autoswitch.threshold "$1" || return
-      if systemctl --user is-active --quiet "$unit"; then systemctl --user restart "$unit"; fi
+      timeout 30 "$cs" config set autoswitch.threshold "$1" || return
+      systemctl --user is-active --quiet "$unit" 2>/dev/null || return 0
+      if ours; then
+        timeout 30 systemctl --user restart "$unit"
+      else
+        # stdout, so the panel shows it even though the change itself worked.
+        echo "threshold saved; $unit was not installed by this widget, restart it yourself to apply it"
+      fi
     }
     wrap set_and_restart "$2"
     ;;
   auto)
     if [ "$2" = on ]; then
-      # The unit template arrives on stdin; install it only where it is missing.
-      template=$(cat)
+      # The unit template arrives on stdin; one over IN_MAX bytes is refused
+      # rather than installed cut short.
+      template=$(head -c $((IN_MAX + 1)))
+      [ "$(printf '%s' "$template" | wc -c)" -le "$IN_MAX" ] || template=""
       auto_on() {
-        if [ "$(systemctl --user show -p LoadState --value "$unit")" = not-found ]; then
-          [ -n "$template" ] || { echo "no unit template to install" >&2; return 1; }
-          mkdir -p "$HOME/.config/systemd/user" "$HOME/.local/state/claude-swap" || return
-          printf '%s\n' "${template//@CSWAP@/$cs}" > "$HOME/.config/systemd/user/$unit" || return
-          systemctl --user daemon-reload || return
-          echo "installed ~/.config/systemd/user/$unit"
+        frag >/dev/null || return
+        if [ ! -e "$unit_path" ] && [ ! -L "$unit_path" ] &&
+           [ "$(systemctl --user show -p LoadState --value "$unit")" = not-found ]; then
+          install_unit || return
         fi
-        systemctl --user enable --now "$unit"
+        must_be_ours || return
+        timeout 30 systemctl --user enable --now "$unit"
       }
       wrap auto_on
     else
-      wrap systemctl --user disable --now "$unit"
+      auto_off() { must_be_ours || return; timeout 30 systemctl --user disable --now "$unit"; }
+      wrap auto_off
     fi
     ;;
   disable|enable) wrap timeout 30 "$cs" "$1" "$2" ;;
@@ -144,12 +257,13 @@ case "$1" in
     # "overwrite slot?" question answers itself with no.
     add_current() {
       timeout 60 "$cs" add </dev/null >&2 || return
-      timeout 30 "$cs" status --json | jq -c '{email: .active.email, number: .active.number}'
+      timeout 30 "$cs" status --json | cap | jq -c '{email: .active.email, number: .active.number}'
     }
     wrap add_current
     ;;
   add-token)
-    token=$(cat)
+    token=$(head -c $((IN_MAX + 1)))
+    [ "$(printf '%s' "$token" | wc -c)" -le "$IN_MAX" ] || { wrap sh -c 'echo "token too long" >&2; exit 2'; exit 0; }
     if [ -n "$2" ]; then wrap timeout 60 "$cs" add-token - --email "$2" <<<"$token"
     else wrap timeout 60 "$cs" add-token - <<<"$token"; fi
     ;;
@@ -170,83 +284,133 @@ host_of() {   # machine name or host -> host spec
   return 1
 }
 
-# run_on <host> <target args...>: stdin passes through to the target.
+# run_on <host> <target args...>: stdin passes through to the target. The ssh
+# control socket lives only in the private $XDG_RUNTIME_DIR; without one,
+# every call opens its own connection instead of using a shared path.
+# Every run is bounded in time too: a machine that accepts and then says
+# nothing, or a shared connection over a dead link (ServerAlive notices within
+# ~15 s), cannot hold the panel's poll or its buttons.
 run_on() {
-  local host=$1; shift
+  local host=$1 limit=120 rc; shift
+  [[ ${1:-} == json ]] && limit=45
   if [[ $host == local ]]; then
-    bash -c "$TARGET" cswap-bar "$@"
+    timeout "$limit" bash -c "$TARGET" cswap-bar "$@"
   else
-    ssh -o BatchMode=yes -o ConnectTimeout=5 \
-      -o ControlMaster=auto -o ControlPersist=10m \
-      -o "ControlPath=${XDG_RUNTIME_DIR:-/tmp}/cswap-bar-%C" \
+    local ctl=()
+    if [[ -n ${XDG_RUNTIME_DIR:-} && -d $XDG_RUNTIME_DIR && ! -L $XDG_RUNTIME_DIR && -O $XDG_RUNTIME_DIR ]]; then
+      ctl=(-o ControlMaster=auto -o ControlPersist=10m -o "ControlPath=$XDG_RUNTIME_DIR/cswap-bar-%C")
+    fi
+    timeout "$limit" ssh -o BatchMode=yes -o ConnectTimeout=5 \
+      -o ServerAliveInterval=5 -o ServerAliveCountMax=3 "${ctl[@]}" \
       -- "$host" "$(printf '%q ' bash -c "$TARGET" cswap-bar "$@")"
+  fi
+  rc=$?
+  (( rc == 124 )) && echo "no answer from $(name_of "$host") within ${limit} s" >&2
+  return "$rc"
+}
+
+# bounded <out-file> <err-file> <cmd...>: run cmd with stdout held to
+# MACHINE_MAX bytes as it arrives (one byte over the ceiling is read so
+# overflow shows) and only the first ERR_MAX bytes of stderr kept; the rest of
+# stderr is read and thrown away, so a chatty machine is not cut off mid-write.
+# An answer over the ceiling is emptied and reported: nothing a machine sends
+# grows without bound here.
+bounded() {
+  local out=$1 err=$2; shift 2
+  { "$@" 2>&1 >&3 3>&- | { head -c "$ERR_MAX" >"$err"; cat >/dev/null; }; } 3>&1 | head -c "$((MACHINE_MAX + 1))" >"$out"
+  if (( $(wc -c <"$out") > MACHINE_MAX )); then
+    : >"$out"
+    echo "answer larger than $MACHINE_MAX bytes, ignored" >"$err"
   fi
 }
 
+# record <host> <out-file> <err-file>: {machine, host, data, err}; data is null
+# when the machine could not be reached or did not answer with JSON.
+record() {
+  jq -nc --arg machine "$(name_of "$1")" --arg host "$1" --rawfile out "$2" --rawfile err "$3" \
+    '{machine: $machine, host: $host, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
+}
+
 # fanout <stdin-text> <target args...>: run on every machine in parallel and
-# print {machines: [{machine, host, data, err}]}; data is null when the
-# machine could not be reached.
+# print {machines: [record...]}.
 fanout() {
   local input=$1; shift
-  local tmp i m
-  tmp=$(mktemp -d)
+  local tmp i
+  tmp=$(mktemp -d -p "$WORK") || return 1
+  # 9>&-: the fallback lock stays with this process, not with every child.
   for i in "${!MACHINES[@]}"; do
-    m=${MACHINES[$i]}
-    ( run_on "$m" "$@" <<<"$input" >"$tmp/$i.out" 2>"$tmp/$i.err" ) &
+    bounded "$tmp/$i.out" "$tmp/$i.err" run_on "${MACHINES[$i]}" "$@" <<<"$input" 9>&- &
   done
   wait
   for i in "${!MACHINES[@]}"; do
-    m=${MACHINES[$i]}
-    jq -nc --arg machine "$(name_of "$m")" --arg host "$m" \
-      --rawfile out "$tmp/$i.out" --rawfile err "$tmp/$i.err" \
-      '{machine: $machine, host: $host, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
+    record "${MACHINES[$i]}" "$tmp/$i.out" "$tmp/$i.err"
   done | jq -sc '{machines: .}'
   rm -rf "$tmp"
 }
 
 # one <host> <target args...>: the same record for a single machine.
 one() {
-  local host=$1; shift
-  local out err
-  err=$(mktemp)
-  out=$(run_on "$host" "$@" </dev/null 2>"$err")
-  jq -nc --arg machine "$(name_of "$host")" --arg host "$host" --arg out "$out" --rawfile err "$err" \
-    '{machine: $machine, host: $host, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
-  rm -f "$err"
+  local host=$1 tmp; shift
+  tmp=$(mktemp -d -p "$WORK") || return 1
+  bounded "$tmp/out" "$tmp/err" run_on "$host" "$@" </dev/null
+  record "$host" "$tmp/out" "$tmp/err"
+  rm -rf "$tmp"
 }
 
 # copy_out <email>: stream the account from this machine to every other one
 # (`cswap import` skips a machine that already has it). The credential only
 # travels through a pipe, never a file outside claude-swap's own store.
+copy_pipe() { run_on local export "$1" </dev/null | run_on "$2" import; }
 copy_out() {
-  local email=$1 m out err
+  local email=$1 m tmp
   for m in "${MACHINES[@]}"; do
     [[ $m == local ]] && continue
-    err=$(mktemp)
-    out=$(run_on local export "$email" </dev/null 2>"$err" | run_on "$m" import 2>>"$err")
-    jq -nc --arg machine "$(name_of "$m")" --arg host "$m" --arg out "$out" --rawfile err "$err" \
-      '{machine: $machine, host: $host, copied: true, data: ($out | fromjson? // null), err: ($err | .[-400:])}'
-    rm -f "$err"
+    tmp=$(mktemp -d -p "$WORK") || return 1
+    bounded "$tmp/out" "$tmp/err" copy_pipe "$email" "$m"
+    record "$m" "$tmp/out" "$tmp/err" | jq -c '.copied = true'
+    rm -rf "$tmp"
   done
 }
 
 FALLBACK_COOLDOWN=900
-fallback_state="${XDG_STATE_HOME:-$HOME/.local/state}/cswap-bar"
+
+# state_dir: the private directory for the fallback stamp, created 0700 and
+# checked every time: a real directory (not a symlink) that we own, reset to
+# 0700. Prints its path.
+state_dir() {
+  local d="${XDG_STATE_HOME:-$HOME/.local/state}/cswap-bar"
+  mkdir -p -m 700 -- "$d" 2>/dev/null
+  [[ -d $d && ! -L $d && -O $d ]] || return 1
+  chmod 700 -- "$d" || return 1
+  printf '%s\n' "$d"
+}
 
 # fallback <email>: one automatic switch per cooldown, whoever asks. The lock
 # makes concurrent bar instances agree; the stamp survives a shell restart.
 fallback() {
-  local email=$1 now last out
-  mkdir -p "$fallback_state" 2>/dev/null
-  exec 9>"$fallback_state/fallback.lock" || refuse "cannot lock"
+  local email=$1 d now last=0 out tmp
+  d=$(state_dir) || refuse "cannot use the private state directory"
+  # Left by versions before 1.3, which locked a file here. rm never follows.
+  rm -f -- "$d/fallback.lock"
+  # The lock is taken on the directory itself, so no lock file is opened.
+  exec 9<"$d" || refuse "cannot lock"
   flock -n 9 || refuse "another fallback is running"
   now=$(date +%s)
-  last=$(cat "$fallback_state/fallback.stamp" 2>/dev/null || echo 0)
-  [[ $last =~ ^[0-9]+$ ]] || last=0
-  if (( now - last < FALLBACK_COOLDOWN )); then
-    refuse "automatic switch is on cooldown ($(( (FALLBACK_COOLDOWN - now + last) / 60 + 1 )) min left)"
+  if [[ -f $d/fallback.stamp && ! -L $d/fallback.stamp ]]; then
+    last=$(head -c 32 -- "$d/fallback.stamp")
   fi
-  echo "$now" > "$fallback_state/fallback.stamp"
+  [[ $last =~ ^[0-9]+$ ]] || last=0
+  (( last > now )) && last=0   # clock stepped back: never block for longer than a cooldown
+  if (( now - last < FALLBACK_COOLDOWN )); then
+    refuse "automatic switch is on cooldown ($(( (FALLBACK_COOLDOWN - now + last + 59) / 60 )) min left)"
+  fi
+  # A new file (mktemp: O_EXCL, mode 0600) renamed over the stamp. rename()
+  # replaces the directory entry itself and never follows a symlink there.
+  tmp=$(mktemp "$d/.fallback.stamp.XXXXXX") || refuse "cannot write the fallback stamp"
+  if ! { printf '%s\n' "$now" >"$tmp" && mv -fT -- "$tmp" "$d/fallback.stamp"; }; then
+    rm -f -- "$tmp"
+    refuse "cannot write the fallback stamp"
+  fi
   out=$(fanout "" switch "$email")
   printf '%s\n' "$out"
   if [[ $(jq -r '[.machines[] | select(.data.code == 0)] | length' <<<"$out") -gt 0 ]]; then
@@ -258,59 +422,80 @@ fallback() {
 
 usage() { echo "usage: cswap-bar [--machines a,b] [--local-name n] json|switch <email>|only <machine> <email>|threshold <pct>|auto on|off|disable <email>|enable <email>|remove <email>|add-login|copy <email>|add-token [email]" >&2; exit 2; }
 
-# refuse <message>: an action result the panel shows as an error line.
-refuse() {
+refuse_json() {
   jq -nc --arg msg "$1" '{machines: [{machine: "refused", host: "", err: "",
     data: {code: 1, result: {error: {message: $msg}}, out: "", err: ""}}]}'
-  exit 1
 }
 
-cmd=${1:-}; shift || true
-case "$cmd" in
-  json)
-    fanout "" json
-    ;;
-  switch|disable|enable|remove)
-    valid_account "${1:-}" || usage
-    fanout "" "$cmd" "$1"
-    ;;
-  only)
-    h=$(host_of "${1:-}") || usage
-    valid_account "${2:-}" || usage
-    one "$h" switch "$2" | jq -sc '{machines: .}'
-    ;;
-  threshold)
-    [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || usage
-    fanout "" threshold "$1"
-    ;;
-  auto)
-    case "${1:-}" in
-      on)  fanout "$(cat "$HERE/systemd/claude-swap-auto.service" 2>/dev/null)" auto on ;;
-      off) fanout "" auto off ;;
-      *)   usage ;;
-    esac
-    ;;
-  add-login)
-    host_of local >/dev/null || refuse "Logins can only be added from this machine, and it is not in the machine list"
-    rec=$(one local add)
-    email=$(jq -r '.data.result.email // empty' <<<"$rec")
-    valid_account "$email" || email=""
-    { echo "$rec"; [[ -n $email ]] && copy_out "$email"; } | jq -sc '{machines: .}'
-    ;;
-  copy)
-    valid_account "${1:-}" || usage
-    host_of local >/dev/null || refuse "Accounts are only copied from this machine, and it is not in the machine list"
-    copy_out "$1" | jq -sc '{machines: .}'
-    ;;
-  fallback)
-    valid_account "${1:-}" || usage
-    fallback "$1"
-    ;;
-  add-token)
-    token=$(cat)
-    [[ -n $token ]] || { echo "add-token: token expected on stdin" >&2; exit 2; }
-    [[ -z ${1:-} ]] || valid_account "$1" || usage
-    fanout "$token" add-token "${1:-}"
-    ;;
-  *) usage ;;
-esac
+# refuse <message>: an action result the panel shows as an error line.
+refuse() { refuse_json "$1"; exit 1; }
+
+main() {
+  local cmd=${1:-} h rec email token
+  shift || true
+  case "$cmd" in
+    json)
+      fanout "" json
+      ;;
+    switch|disable|enable|remove)
+      valid_account "${1:-}" || usage
+      fanout "" "$cmd" "$1"
+      ;;
+    only)
+      h=$(host_of "${1:-}") || usage
+      valid_account "${2:-}" || usage
+      one "$h" switch "$2" | jq -sc '{machines: .}'
+      ;;
+    threshold)
+      [[ ${1:-} =~ ^[0-9]+(\.[0-9]+)?$ ]] || usage
+      fanout "" threshold "$1"
+      ;;
+    auto)
+      case "${1:-}" in
+        on)  fanout "$(head -c "$INPUT_MAX" "$HERE/systemd/claude-swap-auto.service" 2>/dev/null)" auto on ;;
+        off) fanout "" auto off ;;
+        *)   usage ;;
+      esac
+      ;;
+    add-login)
+      host_of local >/dev/null || refuse "Logins can only be added from this machine, and it is not in the machine list"
+      rec=$(one local add)
+      email=$(jq -r '.data.result.email // empty' <<<"$rec")
+      valid_account "$email" || email=""
+      { echo "$rec"; [[ -n $email ]] && copy_out "$email"; } | jq -sc '{machines: .}'
+      ;;
+    copy)
+      valid_account "${1:-}" || usage
+      host_of local >/dev/null || refuse "Accounts are only copied from this machine, and it is not in the machine list"
+      copy_out "$1" | jq -sc '{machines: .}'
+      ;;
+    fallback)
+      valid_account "${1:-}" || usage
+      fallback "$1"
+      ;;
+    add-token)
+      token=$(head -c "$((INPUT_MAX + 1))")
+      [[ -n $token ]] || { echo "add-token: token expected on stdin" >&2; exit 2; }
+      (( $(printf '%s' "$token" | wc -c) <= INPUT_MAX )) || refuse "token longer than $INPUT_MAX bytes"
+      [[ -z ${1:-} ]] || valid_account "$1" || usage
+      fanout "$token" add-token "${1:-}"
+      ;;
+    *) usage ;;
+  esac
+}
+
+# final_cap: everything the panel reads passes through here, at most FINAL_MAX
+# bytes; a larger answer is replaced by an error instead of being cut.
+final_cap() {
+  local f
+  f=$(mktemp -p "$WORK") || exit 1
+  head -c "$((FINAL_MAX + 1))" >"$f"
+  if (( $(wc -c <"$f") > FINAL_MAX )); then
+    refuse_json "answer larger than $FINAL_MAX bytes, ignored"
+  else
+    cat "$f"
+  fi
+  rm -f "$f"
+}
+
+main "$@" | final_cap
