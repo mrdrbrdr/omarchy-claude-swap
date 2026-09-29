@@ -514,7 +514,7 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(440))
+    contentWidth: panel.fittedContentWidth(Style.space(380))
     contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(1100))
 
     PanelKeyCatcher {
@@ -1052,7 +1052,11 @@ Panel {
           visible: !card.activeEverywhere
           anchors.right: parent.right
           anchors.verticalCenter: parent.verticalCenter
-          text: card.armed ? "Confirm switch" : "Switch (" + (card.account ? card.account.number : "") + ")"
+          iconText: card.armed ? "󰄬" : "󰓡"
+          iconSize: Style.font.body
+          text: card.armed ? "Confirm" : "Switch"
+          tooltipText: card.account ? "Switch to #" + card.account.number + " " + card.account.email : ""
+          horizontalPadding: Style.space(10)
           fontSize: Style.font.caption
           foreground: card.armed ? root.urgent : root.foreground
           fontFamily: root.fontFamily
@@ -1063,12 +1067,17 @@ Panel {
       }
     }
 
-    Repeater {
-      model: card.windows
-      LimitRow {
-        required property var modelData
-        width: card.width
-        window: modelData
+    // The limit rows sit closer together than the card's own spacing.
+    Column {
+      width: card.width
+      spacing: 0
+      Repeater {
+        model: card.windows
+        LimitRow {
+          required property var modelData
+          width: card.width
+          window: modelData
+        }
       }
     }
   }
@@ -1081,7 +1090,7 @@ Panel {
     readonly property bool alarming: pct >= root.shownThreshold
     readonly property real thickness: Math.max(Style.space(4), Math.round(Style.spacing.controlHeight * 0.14))
 
-    implicitHeight: Math.max(limitLabel.implicitHeight, limitValue.implicitHeight) + Style.spacing.sm
+    implicitHeight: Math.max(limitLabel.implicitHeight, limitValue.implicitHeight) + Style.space(4)
 
     Text {
       id: limitLabel
