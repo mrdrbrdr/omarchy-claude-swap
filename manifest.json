@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "mrdrbrdr.claude-swap",
   "name": "Claude Swap",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "author": "mrdrbrdr",
   "license": "MIT",
   "description": "Automatic account switching for Claude Code, right in your Omarchy bar. Hit 90% on one account and Claude Swap quietly moves you to the next. It just works!",

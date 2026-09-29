@@ -236,6 +236,13 @@ Panel {
     return best
   }
 
+  // Text for an auto-formatted Qt Text that must stay plain: without < and >
+  // there is no tag, so Qt never treats it as rich text (no <img> fetch).
+  // Emails and machine names cannot contain them; error text shows ‹ › instead.
+  function plainTooltip(s) {
+    return String(s).replace(/</g, "‹").replace(/>/g, "›")
+  }
+
   // cswap sends microsecond ISO stamps ("…:00.215949+00:00"); V4 wants them trimmed.
   function parseMs(iso) {
     if (!iso) return NaN
@@ -497,12 +504,16 @@ Panel {
     bar: root.bar
     text: root.barLabel
     active: root.alarming
+    // The bar's shared tooltip auto-detects rich text and has no plain-text
+    // switch, while these lines carry emails, machine names and error text
+    // from claude-swap and ssh. plainTooltip() keeps that from ever parsing
+    // as markup.
     tooltipText: {
       if (!root.primaryActive)
-        return root.issues.length ? root.issues[0].text : (root.noAccounts ? "claude-swap has no accounts yet" : "Loading…")
+        return root.plainTooltip(root.issues.length ? root.issues[0].text : (root.noAccounts ? "claude-swap has no accounts yet" : "Loading…"))
       var lines = root.activeByMachine.map(function(a) { return a.machine + ": #" + root.displayNumber(a.email) + " " + a.email })
       if (root.issues.length) lines.push(root.issues[0].text)
-      return lines.join("\n")
+      return root.plainTooltip(lines.join("\n"))
     }
     onPressed: function(b) { if (b === Qt.LeftButton) root.toggle() }
   }
